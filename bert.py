@@ -25,7 +25,7 @@ df['Context'] = df['Context'].astype(str)
 df['Answer'] = df['Answer'].astype(str)
 df['start_positions'], df['end_positions'] = find_answer_positions(df['Context'], df['Answer'])
 
-# Tokenize and create dataset (unchanged)
+# Tokenize and create dataset
 inputs = tokenizer(df['Context'].tolist(), df['Question'].tolist(), return_tensors='pt', padding=True, truncation=True, max_length=512, return_token_type_ids=True, return_attention_mask=True)
 inputs['start_positions'] = torch.tensor(df['start_positions'].tolist())
 inputs['end_positions'] = torch.tensor(df['end_positions'].tolist())
