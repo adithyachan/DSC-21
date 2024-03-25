@@ -1,35 +1,58 @@
-from transformers import BertTokenizer, BertForQuestionAnswering, AdamW, get_linear_schedule_with_warmup
+from transformers import BertTokenizerFast, BertForMaskedLM, AdamW, get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset, random_split
 import torch
 import pandas as pd
 import os
 
-# Function to find answer positions
-def find_answer_positions(contexts, answers):
-    start_positions = []
-    end_positions = []
-    for context, answer in zip(contexts, answers):
-        start_position = context.find(answer)
-        end_position = start_position + len(answer) - 1
-        start_positions.append(start_position)
-        end_positions.append(end_position)
-    return start_positions, end_positions
 
-# Load tokenizer and model
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertForQuestionAnswering.from_pretrained('bert-base-uncased')
+def preprocess_for_answer_prediction(df, tokenizer):
+    input_ids = []
+    attention_masks = []
+    labels = []  # Will store original token IDs for masked tokens and -100 elsewhere
 
-# Load dataset 
+    for index, row in df.iterrows():
+        context_question = f"{row['Question']} {tokenizer.sep_token} {row['Context']}"
+        tokenized_input = tokenizer(context_question, max_length=512, truncation=True, padding="max_length",
+                                    return_tensors="pt", return_offsets_mapping=True)
+        input_ids_seq = tokenized_input["input_ids"].squeeze().tolist()
+        attention_mask_seq = tokenized_input["attention_mask"].squeeze().tolist()
+        offset_mapping = tokenized_input["offset_mapping"].squeeze().tolist()
+        tokenized_input.pop("offset_mapping")
+
+        # Initialize labels with -100
+        label_seq = [-100] * len(input_ids_seq)
+
+        if row['Answer Indices'] != "[]":  # Check if there are answers
+            for ans_indices in eval(row['Answer Indices']):  # Processing each set of answer indices
+                start_char, end_char = eval(ans_indices)  # Convert string to tuple
+
+                # Find token indexes corresponding to start_char and end_char
+                start_token = next((idx for idx, offset in enumerate(offset_mapping) if offset[0] == start_char), None)
+                end_token = next((idx for idx, offset in enumerate(offset_mapping) if offset[1] == end_char), None)
+
+                if start_token is not None and end_token is not None:
+                    # Mask answer tokens
+                    for idx in range(start_token, end_token + 1):
+                        input_ids_seq[idx] = tokenizer.mask_token_id
+                        # Set label for masked token
+                        correct_token_id = tokenizer.encode(row['Context'][start_char:end_char],
+                                                            add_special_tokens=False)
+                        label_seq[idx] = correct_token_id[0] if correct_token_id else -100  # Handle potential mismatch
+
+        input_ids.append(input_ids_seq)
+        attention_masks.append(attention_mask_seq)
+        labels.append(label_seq)
+
+    return TensorDataset(torch.tensor(input_ids), torch.tensor(attention_masks), torch.tensor(labels))
+
+
 df = pd.read_csv("temporal_qa_data.csv")
-df['Context'] = df['Context'].astype(str)
-df['Answer'] = df['Answer'].astype(str)
-df['start_positions'], df['end_positions'] = find_answer_positions(df['Context'], df['Answer'])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+dataset = preprocess_for_answer_prediction(df, tokenizer)
+model = BertForMaskedLM.from_pretrained('bert-base-uncased').to(device)
 
-# Tokenize and create dataset
-inputs = tokenizer(df['Context'].tolist(), df['Question'].tolist(), return_tensors='pt', padding=True, truncation=True, max_length=512, return_token_type_ids=True, return_attention_mask=True)
-inputs['start_positions'] = torch.tensor(df['start_positions'].tolist())
-inputs['end_positions'] = torch.tensor(df['end_positions'].tolist())
-dataset = TensorDataset(inputs['input_ids'], inputs['attention_mask'], inputs['token_type_ids'], inputs['start_positions'], inputs['end_positions'])
+print(df.head())
 
 # Split dataset and create dataloaders
 total_size = len(dataset)
@@ -37,10 +60,8 @@ train_size = int(0.7 * total_size)
 val_size = int(0.2 * total_size)
 test_size = total_size - train_size - val_size
 
-# Splitting the dataset
 train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
 
-# Creating data loaders for train, validation, and test sets
 train_dataloader = DataLoader(train_dataset, sampler=RandomSampler(train_dataset), batch_size=10)
 val_dataloader = DataLoader(val_dataset, sampler=SequentialSampler(val_dataset), batch_size=10)
 test_dataloader = DataLoader(test_dataset, sampler=SequentialSampler(test_dataset), batch_size=10)
@@ -48,23 +69,19 @@ test_dataloader = DataLoader(test_dataset, sampler=SequentialSampler(test_datase
 # Save the test dataset for later evaluation
 torch.save(test_dataset, 'test_dataset.pt')
 
-# Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-# Initialize optimizer
 optimizer = AdamW(model.parameters(), lr=5e-5)
 
-checkpoint_dir = "DSC-21/model_checkpoints"
+checkpoint_dir = "model_checkpoints"
 if not os.path.exists(checkpoint_dir):
     os.makedirs(checkpoint_dir)
 
-# Define epochs
 epochs = 100
 
-# Load checkpoint if exists
 start_epoch = 0
-start_step = 0  # New variable to keep track of step
+start_step = 0
 latest_checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pth")
 
 if os.path.exists(latest_checkpoint_path):
@@ -72,52 +89,39 @@ if os.path.exists(latest_checkpoint_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch']
-    start_step = checkpoint.get('step', 0)  # Ensure backward compatibility
+    start_step = checkpoint.get('step', 0)  # For resuming training correctly
     print(f"Resuming training from epoch {start_epoch}, step {start_step}.")
 else:
     print("No checkpoint found. Starting training from scratch.")
 
-# Calculate total steps for the scheduler considering continuation from checkpoint
 total_steps = len(train_dataloader) * (epochs - start_epoch)
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
-# Adjusted training loop
+model.train()
 for epoch in range(start_epoch, epochs):
-    # Adjust enumeration of train_dataloader to start from `start_step` if resuming
-    iterable_dataloader = enumerate(train_dataloader)
-    if epoch == start_epoch and start_step > 0:
-        # Fast-forward to start_step if resuming in the middle of an epoch
-        for _ in range(start_step):
-            next(iterable_dataloader)
+    for step, (input_ids, attention_mask, labels) in enumerate(train_dataloader, start=start_step):
+        if step == start_step:
+            start_step = 0  # Reset start_step for subsequent epochs
 
-    for step, batch in iterable_dataloader:
-        batch = tuple(t.to(device) for t in batch)
-        inputs = {
-            'input_ids': batch[0],
-            'attention_mask': batch[1],
-            'token_type_ids': batch[2],
-            'start_positions': batch[3],
-            'end_positions': batch[4]
-        }
+        input_ids, attention_mask, labels = input_ids.to(device), attention_mask.to(device), labels.to(device)
 
         model.zero_grad()
-        outputs = model(**inputs)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-        # Adjusted print and checkpoint logic
-        if (step + 1) % 20 == 0 or (step + 1) == len(train_dataloader):
+        if (step + 1) % 20 == 0:
             print(f"Epoch: {epoch}, Step: {step + 1}, Loss: {loss.item()}")
             checkpoint = {
-                'epoch': epoch,
-                'step': step + 1,  # Save the next step to resume from
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'step': step + 1,
             }
             torch.save(checkpoint, latest_checkpoint_path)
 
-# Final model save
+# Save the final model
 model.save_pretrained('./finetuned_bert')
