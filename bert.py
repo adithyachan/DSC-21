@@ -1,5 +1,5 @@
 from transformers import BertTokenizer, BertForQuestionAnswering, AdamW, get_linear_schedule_with_warmup
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset, random_split
 import torch
 import pandas as pd
 import os
@@ -19,7 +19,7 @@ def find_answer_positions(contexts, answers):
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertForQuestionAnswering.from_pretrained('bert-base-uncased')
 
-# Load dataset (unchanged)
+# Load dataset 
 df = pd.read_csv("temporal_qa_data.csv")
 df['Context'] = df['Context'].astype(str)
 df['Answer'] = df['Answer'].astype(str)
@@ -31,19 +31,31 @@ inputs['start_positions'] = torch.tensor(df['start_positions'].tolist())
 inputs['end_positions'] = torch.tensor(df['end_positions'].tolist())
 dataset = TensorDataset(inputs['input_ids'], inputs['attention_mask'], inputs['token_type_ids'], inputs['start_positions'], inputs['end_positions'])
 
-# Split dataset and create dataloaders (unchanged)
-train_dataset, val_dataset = torch.utils.data.random_split(dataset, [int(0.8 * len(dataset)), len(dataset) - int(0.8 * len(dataset))])
+# Split dataset and create dataloaders
+total_size = len(dataset)
+train_size = int(0.7 * total_size)
+val_size = int(0.2 * total_size)
+test_size = total_size - train_size - val_size
+
+# Splitting the dataset
+train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+# Creating data loaders for train, validation, and test sets
 train_dataloader = DataLoader(train_dataset, sampler=RandomSampler(train_dataset), batch_size=10)
 val_dataloader = DataLoader(val_dataset, sampler=SequentialSampler(val_dataset), batch_size=10)
+test_dataloader = DataLoader(test_dataset, sampler=SequentialSampler(test_dataset), batch_size=10)
 
-# Device setup (unchanged)
+# Save the test dataset for later evaluation
+torch.save(test_dataset, 'test_dataset.pt')
+
+# Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # Initialize optimizer
 optimizer = AdamW(model.parameters(), lr=5e-5)
 
-checkpoint_dir = "./model_checkpoints"
+checkpoint_dir = "DSC-21/model_checkpoints"
 if not os.path.exists(checkpoint_dir):
     os.makedirs(checkpoint_dir)
 
