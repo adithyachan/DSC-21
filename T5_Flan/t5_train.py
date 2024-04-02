@@ -4,7 +4,7 @@ import time
 import csv
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import T5Tokenizer, DataCollatorWithPadding, T5ForConditionalGeneration, AdamW
+from transformers import T5Tokenizer, DataCollatorWithPadding, T5ForQuestionAnswering, AdamW
 
 if __name__ == '__main__':
     import torch.multiprocessing as mp
@@ -38,6 +38,7 @@ if __name__ == '__main__':
     tokenized_dataset = []
 
     print("---------- TOKENIZING ----------")
+    max_answer_length = 0
     for example in dataset:
         context = example["Context"]
         question = example["Question"]
@@ -55,21 +56,40 @@ if __name__ == '__main__':
             return_tensors="pt"
         )
 
-        # Tokenize the answer text as the label
-        tokenized_labels = tokenizer(
-            answer,
-            add_special_tokens=True,
-            truncation=True,
-            padding="max_length",
-            max_length=512,
-            return_tensors="pt"
-        )
+        # Preprocess the answer string and tokenize each keyword separately
+        answer_keywords = answer.strip("[]").split(", ")
+        start_positions = []
+        end_positions = []
+
+        for keyword in answer_keywords:
+            keyword_tokens = tokenizer.encode(keyword, add_special_tokens=False)
+            keyword_len = len(keyword_tokens)
+
+            if keyword_tokens:
+                # Find the start and end positions of the keyword in the tokenized context
+                context_ids = tokenized_inputs["input_ids"][0].tolist()
+                try:
+                    start_pos = context_ids.index(keyword_tokens[0])
+                    end_pos = start_pos + keyword_len - 1
+
+                    start_positions.append(start_pos)
+                    end_positions.append(end_pos)
+                except ValueError:
+                    # Keyword not found in the context
+                    pass
+
+        max_answer_length = max(max_answer_length, len(start_positions))
+
+        start_position = start_positions[0] if start_positions else 0
+        end_position = end_positions[0] if end_positions else 0
 
         tokenized_example = {
             "input_ids": tokenized_inputs["input_ids"].squeeze().tolist(),
-            "labels": tokenized_labels["input_ids"].squeeze().tolist(),
+            "attention_mask": tokenized_inputs["attention_mask"].squeeze().tolist(),
+            "start_position": start_position,
+            "end_position": end_position,
             "category": example["Category"]
-        }
+}
 
         tokenized_dataset.append(tokenized_example)
 
@@ -85,7 +105,9 @@ if __name__ == '__main__':
         def __getitem__(self, index):
             return {
                 "input_ids": torch.tensor(self.dataset[index]["input_ids"], dtype=torch.long),
-                "labels": torch.tensor(self.dataset[index]["labels"], dtype=torch.long),
+                "attention_mask": torch.tensor(self.dataset[index]["attention_mask"], dtype=torch.long),
+                "start_position": torch.tensor(self.dataset[index]["start_position"], dtype=torch.long),
+                "end_position": torch.tensor(self.dataset[index]["end_position"], dtype=torch.long),
                 "category": self.dataset[index]["category"]
             }
 
@@ -102,8 +124,10 @@ if __name__ == '__main__':
     val_dataloader = DataLoader(val_dataset, batch_size=10, num_workers=0, pin_memory=True)
     test_dataloader = DataLoader(test_dataset, batch_size=10, num_workers=0, pin_memory=True)
 
+
+
     print("---------- TRAINING ----------")
-    model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-small")
+    model = T5ForQuestionAnswering.from_pretrained("google/flan-t5-small")
     model.to(device)
 
     # optimizer and learning rate
@@ -124,7 +148,7 @@ if __name__ == '__main__':
     if checkpoint_files:
         latest_checkpoint = os.path.join(checkpoint_dir, checkpoint_files[0])
         print(f"Resuming from checkpoint: {latest_checkpoint}")
-        checkpoint = torch.load(latest_checkpoint)
+        checkpoint = torch.load(latest_checkpoint, map_location=device)
         start_epoch = checkpoint['epoch']
         start_batch_idx = checkpoint['batch_idx'] + 1
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -148,9 +172,17 @@ if __name__ == '__main__':
             start_time_batch = time.time()  # Start time of the batch processing
 
             input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            start_position = batch["start_position"].to(device)
+            end_position = batch["end_position"].to(device)
 
-            outputs = model(input_ids=input_ids, labels=labels)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                start_positions=start_position,
+                end_positions=end_position
+            )
+
             loss = outputs.loss
 
             loss.backward()
@@ -164,20 +196,22 @@ if __name__ == '__main__':
             end_time_batch = time.time()  # End time of the batch processing
             print(f"Epoch: {epoch + 1}/{num_epochs}, Batch: {batch_idx}/{len(train_dataloader)}, Loss: {loss.item():.4f}, Grad Norm: {total_grad_norm:.4f}, Time per batch: {(end_time_batch - start_time_batch):.2f} seconds")
 
-            if (batch_idx + 1) % 10 == 0:  # Log every 10 batches
-                checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'batch_idx': batch_idx,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss.item(),
-                }, checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}.")
+            if batch_idx % 10 == 0 and batch_idx != 0:  # checkpoint every 10 batches
+                try:
+                    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pt")
+                    torch.save({
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': loss.item(),
+                    }, checkpoint_path)
+                    print(f"Saved checkpoint to {checkpoint_path}.")
+                except Exception as e:
+                    print(f"Error occurred while saving checkpoint: {str(e)}")
 
         end_time_epoch = time.time()  # End time of the epoch
         print(f"Epoch [{epoch + 1}/{num_epochs}] completed. Time per epoch: {(end_time_epoch - start_time_epoch):.2f} seconds")
-
 
     print("---------- MODEL SAVING ----------")
 
@@ -194,9 +228,17 @@ if __name__ == '__main__':
     with torch.no_grad():
         for batch in test_dataloader:
             input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            start_position = batch["start_positions"].to(device)
+            end_position = batch["end_positions"].to(device)
 
-            outputs = model(input_ids=input_ids, labels=labels)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                start_position=start_position,
+                end_position=end_position
+            )
+
             loss = outputs.loss
             total_loss += loss.item()
 
