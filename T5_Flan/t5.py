@@ -258,6 +258,30 @@ def inference(model, tokenizer, question, context):
 
     return answer
 
+def untrained_inference(tokenizer, question, context):
+    model = T5ForQuestionAnswering.from_pretrained("google/flan-t5-small")
+    model.to(device)
+    model.eval()
+
+    input_text = f"question: {question} context: {context}"
+    input_ids = tokenizer.encode(input_text, return_tensors="pt")
+    input_ids = input_ids.to(model.device)
+
+    with torch.no_grad():
+        outputs = model(input_ids)
+        start_logits = outputs.start_logits
+        end_logits = outputs.end_logits
+
+        answer_start_index = torch.argmax(start_logits)
+        answer_end_index = torch.argmax(end_logits)
+
+        input_ids = input_ids.squeeze()
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+        answer = tokenizer.decode(input_ids[answer_start_index:answer_end_index+1])
+
+    return answer
+
 if __name__ == '__main__':
     mp.set_start_method('spawn')
 
@@ -284,10 +308,16 @@ if __name__ == '__main__':
     print("---------- EVALUATION ----------")
     evaluate_model(model, test_dataloader, device)
 
-    print("---------- INFERENCE  ----------")
-    question = "What event has already finished?"
-    context = "I'm not familiar with how training on an Nvidia GPU works. My code works on Apple MPS pretty well since I've been using a 16GB M1 Pro. I've added a conditional statement at the top set the device to cuda if it's available. I hope that's all it takes. "
+    print("---------- INFERENCE (Trained Model) ----------")
+    question = "What happened after an event?"
+    context = "After developing the World Wide Web, Tim Berners-Lee founded the World Wide Web Consortium (W3C) at MIT in 1994."
     answer = inference(model, tokenizer, question, context)
     print(f"Question: {question}")
     print(f"Context: {context}")
     print(f"Answer: {answer}")
+
+    print("---------- INFERENCE (Untrained Model) ----------")
+    untrained_answer = untrained_inference(tokenizer, question, context)
+    print(f"Question: {question}")
+    print(f"Context: {context}")
+    print(f"Answer: {untrained_answer}")
