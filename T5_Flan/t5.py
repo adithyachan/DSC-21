@@ -215,9 +215,23 @@ def train_model(device, train_dataloader, val_dataloader, tokenizer):
     model.save_pretrained(model_dir)
     return model
 
-def evaluate_model(model, test_dataloader, device):
+def evaluate_keyword_match_accuracy(true_labels, predicted_labels):
+    num_correct = 0
+    num_total = len(true_labels)
+
+    for true_label, predicted_label in zip(true_labels, predicted_labels):
+        # Check if the true label exists in the predicted label
+        if true_label.lower() in predicted_label.lower().split():
+            num_correct += 1
+
+    accuracy = num_correct / num_total if num_total > 0 else 0
+    return accuracy
+
+def evaluate_model(model, test_dataloader, device, tokenizer, k=5):
     model.eval()
     total_loss = 0
+    predictions_dict = {}
+
     with torch.no_grad():
         for batch in test_dataloader:
             input_ids = batch["input_ids"].to(device)
@@ -235,8 +249,49 @@ def evaluate_model(model, test_dataloader, device):
             loss = outputs.loss
             total_loss += loss.item()
 
+            # Get the predicted answer
+            start_logits = outputs.start_logits
+            end_logits = outputs.end_logits
+
+            # Get the top-k start and end indices
+            top_k_start = torch.topk(start_logits, k, dim=1).indices
+            top_k_end = torch.topk(end_logits, k, dim=1).indices
+
+            for i in range(len(input_ids)):
+                true_answer_tokens = input_ids[i][start_position[i]:end_position[i]+1]
+                true_answer = tokenizer.decode(true_answer_tokens)
+
+                # Generate top-k predictions
+                top_k_predictions = []
+                for start_index in top_k_start[i]:
+                    for end_index in top_k_end[i]:
+                        if end_index >= start_index:
+                            answer_tokens = input_ids[i][start_index:end_index+1]
+                            predicted_answer = tokenizer.decode(answer_tokens)
+                            top_k_predictions.append(predicted_answer)
+
+                # Store the true answer and its corresponding top-k predictions
+                predictions_dict[true_answer] = top_k_predictions
+
     avg_loss = total_loss / len(test_dataloader)
     print(f"Test Loss: {avg_loss:.4f}")
+
+    # Calculate top-k accuracy
+    accuracy = top_k_accuracy(predictions_dict)
+    print(f"Top-{k} Accuracy: {accuracy:.4f}")
+
+def top_k_accuracy(predictions_dict):
+    correct = 0
+    total = 0
+    for true_label, predictions in predictions_dict.items():
+        # Check if the true label is among the top k predictions
+        if true_label in predictions:
+            correct += 1
+        total += 1
+
+    # Compute the top-k accuracy
+    accuracy = correct / total if total > 0 else 0
+    return accuracy
 
 def inference(model, tokenizer, question, context):
     input_text = f"question: {question} context: {context}"
@@ -305,8 +360,13 @@ if __name__ == '__main__':
     model_dir = "flan_t5_small_torque_model.pth"
     model.save_pretrained(model_dir)
 
-    print("---------- EVALUATION ----------")
-    evaluate_model(model, test_dataloader, device)
+    print("---------- EVALUATION (Trained Model) ----------")
+    evaluate_model(model, test_dataloader, device, tokenizer)
+
+    print("---------- EVALUATION (Untrained Model) ----------")
+    untrained_model = T5ForQuestionAnswering.from_pretrained("google/flan-t5-small")
+    untrained_model.to(device)
+    evaluate_model(untrained_model, test_dataloader, device, tokenizer)
 
     print("---------- INFERENCE (Trained Model) ----------")
     question = "What happened after an event?"
